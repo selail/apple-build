@@ -1,0 +1,114 @@
+name: Build Apple App
+# Named after the dispatching correlationId so the Luxi server can find this specific run via the Actions
+# REST API — repository_dispatch's own response carries no run id back to the caller. Mirrors
+# selail/windows-build's build-windows-app.yml exactly (see that repo for the sibling Windows pipeline).
+run-name: apple-build-${{ github.event.client_payload.correlationId }}
+
+on:
+  repository_dispatch:
+    types: [build-apple-app]
+
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      # A raw ${{ }} interpolation of sourceZipUrl into any run: step's script text would otherwise be
+      # echoed verbatim in that step's own "##[group]Run ..." log line — and this is a PUBLIC repo, so
+      # that log is world-readable. actions/github-script accesses the payload via the JS `context`
+      # object at runtime instead of through ${{ }} pre-substitution, so nothing is interpolated into
+      # this step's own visible script text; core.setSecret masks the value for every later step's log
+      # output (including their own command-echo lines) from this point on. The URL is presigned and
+      # short-lived regardless — this is defense in depth, not the only safeguard.
+      - name: Mask the source zip URL
+        uses: actions/github-script@v7
+        with:
+          script: core.setSecret(context.payload.client_payload.sourceZipUrl)
+
+      - name: Download source zip
+        run: curl -fsSL -o source.zip "${{ github.event.client_payload.sourceZipUrl }}"
+
+      - name: Unzip source
+        run: |
+          mkdir -p src
+          ditto -x -k source.zip src
+
+      # xcodegen is a Homebrew formula, preinstalled runners just need `brew install` (no tap needed).
+      - name: Install xcodegen
+        run: brew install xcodegen
+
+      - name: Generate the Xcode project
+        working-directory: src
+        run: xcodegen generate
+
+      # One target -> one scheme; discover it instead of hardcoding the generator's naming convention
+      # (mirrors infra/prod/ios-builder/server.py's _first_scheme).
+      - name: Discover the scheme
+        id: scheme
+        working-directory: src
+        run: |
+          scheme=$(xcodebuild -list -json | /usr/bin/python3 -c 'import json,sys; d=json.load(sys.stdin); print((d.get("project") or d.get("workspace") or {}).get("schemes", [""])[0])')
+          if [ -z "$scheme" ]; then
+            echo "no scheme found after xcodegen generate" >&2
+            exit 1
+          fi
+          echo "scheme=$scheme" >> "$GITHUB_OUTPUT"
+
+      # Branches only on the build-flags step — everything else (checkout, xcodegen, scheme discovery,
+      # zip, upload) is shared between the two targets, mirroring how ios-builder/server.py's
+      # _generate_and_build is shared between its /build and /build-macos routes.
+      - name: Build (iOS Simulator)
+        if: github.event.client_payload.target == 'ios-simulator'
+        working-directory: src
+        run: |
+          xcodebuild -scheme "${{ steps.scheme.outputs.scheme }}" -sdk iphonesimulator -configuration Debug \
+            -derivedDataPath build CODE_SIGNING_ALLOWED=NO build
+
+      - name: Build (macOS)
+        if: github.event.client_payload.target == 'macos'
+        working-directory: src
+        run: |
+          xcodebuild -scheme "${{ steps.scheme.outputs.scheme }}" -destination 'platform=macOS' -configuration Debug \
+            -derivedDataPath build CODE_SIGNING_ALLOWED=NO build
+
+      # Ad-hoc sign the macOS build so it launches locally for the end user (no Apple Developer account,
+      # no notarization — v1 limitation, identical to the rented-Mac build worker today: the OS still
+      # blocks first launch outright until "Open Anyway" in System Settings > Privacy & Security).
+      - name: Ad-hoc codesign (macOS only)
+        if: github.event.client_payload.target == 'macos'
+        working-directory: src
+        run: |
+          app=$(find build/Build/Products/Debug -maxdepth 1 -name '*.app' | head -n1)
+          if [ -z "$app" ]; then echo "no .app found under Debug" >&2; exit 1; fi
+          codesign --force --deep --sign - "$app"
+
+      # Stage the .app alone in an otherwise-empty directory (rather than pointing upload-artifact at the
+      # Products dir directly, which can also contain a .dSYM or other build byproducts): upload-artifact
+      # zips the CONTENTS of `path`, not path itself, so the artifact's top-level entry must be exactly
+      # `<name>.app/` — nothing else — to reconstruct a valid double-clickable/Appetize-loadable bundle.
+      - name: Stage the built .app
+        id: app
+        working-directory: src
+        run: |
+          if [ "${{ github.event.client_payload.target }}" = "macos" ]; then
+            product_dir=build/Build/Products/Debug
+          else
+            product_dir=build/Build/Products/Debug-iphonesimulator
+          fi
+          app=$(find "$product_dir" -maxdepth 1 -name '*.app' | head -n1)
+          if [ -z "$app" ]; then echo "no .app found under $product_dir" >&2; exit 1; fi
+          mkdir -p "$GITHUB_WORKSPACE/stage"
+          cp -R "$app" "$GITHUB_WORKSPACE/stage/"
+          echo "dir=stage" >> "$GITHUB_OUTPUT"
+
+      # Downloading this artifact via the Actions API returns a zip whose sole top-level entry is
+      # `<name>.app/` — exactly the app zip the server hands the user / uploads to Appetize, no unwrapping
+      # needed server-side. Mirrors selail/windows-build's build-windows-app.yml (uploads its unzipped
+      # `publish/` dir the same way), adapted here to stage a single bundle instead of a flat file set.
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ github.event.client_payload.correlationId }}
+          path: ${{ steps.app.outputs.dir }}
+          retention-days: 1
+          if-no-files-found: error
