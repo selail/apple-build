@@ -199,8 +199,18 @@ jobs:
       # it for next time regardless of which case this was.
       - name: Export signing identity for reuse (iOS device only)
         if: github.event.client_payload.target == 'ios-device'
+        timeout-minutes: 2
         run: |
-          security export -k "$RUNNER_TEMP/build.keychain" -t identities -f pkcs12 \
+          KEYCHAIN="$RUNNER_TEMP/build.keychain"
+          KEYCHAIN_PW="${{ steps.signing.outputs.keychain-password }}"
+          # A freshly-minted identity (this project's first deploy, no p12 to import beforehand) never
+          # went through the import step's own partition-list fix, since nothing existed in the keychain
+          # yet at that point -- Xcode's own default ACL on a just-created key only trusts codesign/
+          # xcodebuild, not the standalone `security` binary, so an unqualified `security export` hangs
+          # indefinitely waiting on a keychain-access prompt that can never be answered headlessly. By
+          # now (post-Archive) something is always present to fix, whichever case this was.
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PW" "$KEYCHAIN"
+          security export -k "$KEYCHAIN" -t identities -f pkcs12 \
             -P "$(cat p12-password.txt)" -o "$RUNNER_TEMP/signing-identity-out.p12"
 
       # No app binary to hand back for this target -- the artifact is a small JSON status blob instead
