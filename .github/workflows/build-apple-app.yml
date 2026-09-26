@@ -166,6 +166,11 @@ jobs:
           fi
           EXISTING=$(security list-keychains -d user | tr -d '"')
           security list-keychains -d user -s "$KEYCHAIN" $EXISTING
+          # xcodebuild's automatic signing manager (-allowProvisioningUpdates) mints a fresh cert +
+          # private key into the DEFAULT keychain, not merely whatever's first in the search list --
+          # without this, a first deploy's freshly-minted identity lands in the runner's login keychain
+          # instead of ours, and the later "export for reuse" step finds nothing to export.
+          security default-keychain -s "$KEYCHAIN"
 
       - name: Archive (iOS device only)
         if: github.event.client_payload.target == 'ios-device'
