@@ -197,7 +197,6 @@ jobs:
       # artifactFromResponse's {"ok":..,"app":..} envelope).
       - name: Stage deploy result (iOS device only)
         if: github.event.client_payload.target == 'ios-device'
-        id: app
         uses: actions/github-script@v7
         with:
           script: |
@@ -210,7 +209,6 @@ jobs:
               signingCertificateP12: p12.toString('base64'),
               signingCertificatePassword: password,
             }));
-            core.setOutput('dir', 'stage');
 
       # Stage the .app alone in an otherwise-empty directory (rather than pointing upload-artifact at the
       # Products dir directly, which can also contain a .dSYM or other build byproducts): upload-artifact
@@ -218,7 +216,6 @@ jobs:
       # `<name>.app/` — nothing else — to reconstruct a valid double-clickable/Appetize-loadable bundle.
       - name: Stage the built .app
         if: github.event.client_payload.target != 'ios-device'
-        id: app
         working-directory: src
         run: |
           if [ "${{ github.event.client_payload.target }}" = "macos" ]; then
@@ -230,7 +227,6 @@ jobs:
           if [ -z "$app" ]; then echo "no .app found under $product_dir" >&2; exit 1; fi
           mkdir -p "$GITHUB_WORKSPACE/stage"
           cp -R "$app" "$GITHUB_WORKSPACE/stage/"
-          echo "dir=stage" >> "$GITHUB_OUTPUT"
 
       # Downloading this artifact via the Actions API returns a zip whose sole top-level entry is either
       # `<name>.app/` (ios-simulator/macos) or `result.json` (ios-device) — exactly the shape
@@ -240,6 +236,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ${{ github.event.client_payload.correlationId }}
-          path: ${{ steps.app.outputs.dir }}
+          path: stage
           retention-days: 1
           if-no-files-found: error
