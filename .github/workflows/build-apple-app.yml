@@ -172,6 +172,7 @@ jobs:
         working-directory: src
         run: |
           xcodebuild archive -scheme "${{ steps.scheme.outputs.scheme }}" \
+            -configuration Release \
             -destination 'generic/platform=iOS' -archivePath "$RUNNER_TEMP/App.xcarchive" \
             -allowProvisioningUpdates \
             -authenticationKeyPath "$GITHUB_WORKSPACE/AuthKey_${{ steps.signing.outputs.key-id }}.p8" \
