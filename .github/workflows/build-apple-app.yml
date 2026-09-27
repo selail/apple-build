@@ -196,40 +196,42 @@ jobs:
 
       # Re-export whichever identity is now in the keychain -- unchanged bytes if an existing p12 was
       # reused, a freshly-minted one if this was the project's first deploy -- so the caller can persist
-      # it for next time regardless of which case this was.
+      # it for next time regardless of which case this was. Best-effort: a freshly Xcode-minted identity's
+      # default ACL can make even `set-key-partition-list` itself block on a keychain-access prompt that
+      # can never be answered headlessly (unlike a manually-imported identity, which never hits this) --
+      # the archive/export/upload to App Store Connect above has already fully succeeded by this point, so
+      # a failure here only means the next deploy re-mints a certificate instead of reusing this one, not
+      # that this deploy failed. continue-on-error keeps that from taking the whole job down.
       - name: Export signing identity for reuse (iOS device only)
         if: github.event.client_payload.target == 'ios-device'
         timeout-minutes: 2
+        continue-on-error: true
         run: |
           KEYCHAIN="$RUNNER_TEMP/build.keychain"
           KEYCHAIN_PW="${{ steps.signing.outputs.keychain-password }}"
-          # A freshly-minted identity (this project's first deploy, no p12 to import beforehand) never
-          # went through the import step's own partition-list fix, since nothing existed in the keychain
-          # yet at that point -- Xcode's own default ACL on a just-created key only trusts codesign/
-          # xcodebuild, not the standalone `security` binary, so an unqualified `security export` hangs
-          # indefinitely waiting on a keychain-access prompt that can never be answered headlessly. By
-          # now (post-Archive) something is always present to fix, whichever case this was.
           security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PW" "$KEYCHAIN"
           security export -k "$KEYCHAIN" -t identities -f pkcs12 \
             -P "$(cat p12-password.txt)" -o "$RUNNER_TEMP/signing-identity-out.p12"
 
       # No app binary to hand back for this target -- the artifact is a small JSON status blob instead
       # (AppleBuildOrchestrator.deployViaGithubActions parses it via deployOutcomeFromArtifactJson, not
-      # artifactFromResponse's {"ok":..,"app":..} envelope).
+      # artifactFromResponse's {"ok":..,"app":..} envelope). signingCertificateP12/Password are omitted
+      # entirely when the export above didn't produce a file -- the caller treats that as "nothing new to
+      # persist" rather than a failure (see that step's own comment).
       - name: Stage deploy result (iOS device only)
         if: github.event.client_payload.target == 'ios-device'
         uses: actions/github-script@v7
         with:
           script: |
             const fs = require('fs');
-            const p12 = fs.readFileSync(`${process.env.RUNNER_TEMP}/signing-identity-out.p12`);
-            const password = fs.readFileSync('p12-password.txt', 'utf8');
+            const result = { buildNumber: Number('${{ steps.signing.outputs.build-number }}') };
+            const p12Path = `${process.env.RUNNER_TEMP}/signing-identity-out.p12`;
+            if (fs.existsSync(p12Path)) {
+              result.signingCertificateP12 = fs.readFileSync(p12Path).toString('base64');
+              result.signingCertificatePassword = fs.readFileSync('p12-password.txt', 'utf8');
+            }
             fs.mkdirSync('stage', { recursive: true });
-            fs.writeFileSync('stage/result.json', JSON.stringify({
-              buildNumber: Number('${{ steps.signing.outputs.build-number }}'),
-              signingCertificateP12: p12.toString('base64'),
-              signingCertificatePassword: password,
-            }));
+            fs.writeFileSync('stage/result.json', JSON.stringify(result));
 
       # Stage the .app alone in an otherwise-empty directory (rather than pointing upload-artifact at the
       # Products dir directly, which can also contain a .dSYM or other build byproducts): upload-artifact
