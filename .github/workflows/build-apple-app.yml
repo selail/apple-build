@@ -67,12 +67,27 @@ jobs:
       # Branches only on the build-flags step — everything else (checkout, xcodegen, scheme discovery,
       # zip, upload) is shared between the two targets, mirroring how ios-builder/server.py's
       # _generate_and_build is shared between its /build and /build-macos routes.
+      # No CODE_SIGNING_ALLOWED=NO on the command line: Xcode then ad-hoc signs the simulator build itself
+      # and embeds the project's CODE_SIGN_ENTITLEMENTS in the binary the way simulators expect (a
+      # post-build `codesign --entitlements` puts real entitlements in the signature, which a simulator
+      # refuses to run). Needed for Keychain access (GoogleSignIn-iOS). A generated project that sets
+      # CODE_SIGNING_ALLOWED: NO in its own project.yml stays unsigned, as before.
       - name: Build (iOS Simulator)
         if: github.event.client_payload.target == 'ios-simulator'
         working-directory: src
         run: |
           xcodebuild -scheme "${{ steps.scheme.outputs.scheme }}" -sdk iphonesimulator -configuration Debug \
-            -derivedDataPath build CODE_SIGNING_ALLOWED=NO build
+            -derivedDataPath build build
+
+      # Diagnostic only (never fails the job): what signature and entitlements the simulator build ended up with.
+      - name: Inspect simulator signature
+        if: github.event.client_payload.target == 'ios-simulator'
+        continue-on-error: true
+        working-directory: src
+        run: |
+          app=$(find build/Build/Products/Debug-iphonesimulator -maxdepth 1 -name '*.app' | head -n1)
+          codesign -dvv --entitlements :- "$app" 2>&1 | grep -v -i -E '^(Executable|Identifier|TeamIdentifier)=' || true
+          otool -s __TEXT __entitlements "$app/$(basename "$app" .app)" 2>&1 | head -n 20 || true
 
       - name: Build (macOS)
         if: github.event.client_payload.target == 'macos'
