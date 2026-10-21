@@ -11,7 +11,7 @@ on:
 jobs:
   build:
     runs-on: macos-latest
-    timeout-minutes: 20
+    timeout-minutes: 50  # notarization (macos-developer-id) can take a long time; a hung build still stops here
     steps:
       # A raw ${{ }} interpolation of sourceZipUrl/signingUrl into any run: step's script text would
       # otherwise be echoed verbatim in that step's own "##[group]Run ..." log line — and this is a PUBLIC
@@ -39,8 +39,8 @@ jobs:
           mkdir -p src
           ditto -x -k source.zip src
 
-      - name: Download signing payload (iOS device only)
-        if: github.event.client_payload.target == 'ios-device'
+      - name: Download signing payload (iOS device and Developer ID macOS only)
+        if: github.event.client_payload.target == 'ios-device' || github.event.client_payload.target == 'macos-developer-id'
         run: curl -fsSL -o signing.json "${{ github.event.client_payload.signingUrl }}"
 
       # xcodegen is a Homebrew formula, preinstalled runners just need `brew install` (no tap needed).
@@ -248,12 +248,126 @@ jobs:
             fs.mkdirSync('stage', { recursive: true });
             fs.writeFileSync('stage/result.json', JSON.stringify(result));
 
+      # ── Developer ID macOS build: archive → export (developer-id) → notarize → staple → zip ──────────────
+      # For macOS apps that need a real provisioning profile (keychain-access-groups, e.g. GoogleSignIn's
+      # data-protection Keychain session): the generated project.yml carries the project's own team, automatic
+      # signing, hardened runtime and the entitlements file, and the project's App Store Connect API key (signing.json)
+      # lets Xcode mint/fetch the Developer ID certificate and profile (-allowProvisioningUpdates) and notarytool
+      # notarize with it. Notarization failure fails the job (and prints the log). The result is a zip made with ditto
+      # INSIDE the artifact: upload-artifact would drop the permissions/symlinks the signature seals, so the server
+      # unwraps stage/app.zip (NativeBuilderProtocol.innerZip).
+      - name: Prepare Developer ID signing materials (macOS Developer ID only)
+        if: github.event.client_payload.target == 'macos-developer-id'
+        id: macsigning
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const crypto = require('crypto');
+            const signing = JSON.parse(fs.readFileSync('signing.json', 'utf8'));
+            fs.writeFileSync(`AuthKey_${signing.keyId}.p8`, signing.privateKeyP8);
+            const keychainPassword = crypto.randomBytes(24).toString('base64url');
+            core.setSecret(keychainPassword);
+            fs.writeFileSync('ExportOptions-mac.plist', `<?xml version="1.0" encoding="UTF-8"?>
+            <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+            <plist version="1.0">
+            <dict>
+                <key>method</key><string>developer-id</string>
+                <key>teamID</key><string>${signing.teamId}</string>
+                <key>signingStyle</key><string>automatic</string>
+                <key>destination</key><string>export</string>
+            </dict>
+            </plist>
+            `);
+            core.setOutput('key-id', signing.keyId);
+            core.setOutput('issuer-id', signing.issuerId);
+            core.setOutput('keychain-password', keychainPassword);
+
+      - name: Set up signing keychain (macOS Developer ID only)
+        if: github.event.client_payload.target == 'macos-developer-id'
+        run: |
+          KEYCHAIN="$RUNNER_TEMP/build.keychain"
+          KEYCHAIN_PW="${{ steps.macsigning.outputs.keychain-password }}"
+          security create-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+          EXISTING=$(security list-keychains -d user | tr -d '"')
+          security list-keychains -d user -s "$KEYCHAIN" $EXISTING
+          # xcodebuild's automatic signing mints/installs the Developer ID identity into the DEFAULT keychain.
+          security default-keychain -s "$KEYCHAIN"
+
+      - name: Archive (macOS Developer ID only)
+        if: github.event.client_payload.target == 'macos-developer-id'
+        working-directory: src
+        run: |
+          xcodebuild archive -scheme "${{ steps.scheme.outputs.scheme }}" \
+            -configuration Release \
+            -destination 'generic/platform=macOS' -archivePath "$RUNNER_TEMP/App.xcarchive" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$GITHUB_WORKSPACE/AuthKey_${{ steps.macsigning.outputs.key-id }}.p8" \
+            -authenticationKeyID "${{ steps.macsigning.outputs.key-id }}" \
+            -authenticationKeyIssuerID "${{ steps.macsigning.outputs.issuer-id }}"
+
+      - name: Export with Developer ID (macOS Developer ID only)
+        if: github.event.client_payload.target == 'macos-developer-id'
+        run: |
+          xcodebuild -exportArchive -archivePath "$RUNNER_TEMP/App.xcarchive" \
+            -exportPath "$RUNNER_TEMP/export" -exportOptionsPlist "$GITHUB_WORKSPACE/ExportOptions-mac.plist" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$GITHUB_WORKSPACE/AuthKey_${{ steps.macsigning.outputs.key-id }}.p8" \
+            -authenticationKeyID "${{ steps.macsigning.outputs.key-id }}" \
+            -authenticationKeyIssuerID "${{ steps.macsigning.outputs.issuer-id }}"
+
+      # Diagnostic only (never fails the job): the signature, the identity and the entitlements actually embedded.
+      - name: Inspect the signed app (macOS Developer ID only)
+        if: github.event.client_payload.target == 'macos-developer-id'
+        continue-on-error: true
+        run: |
+          app=$(find "$RUNNER_TEMP/export" -maxdepth 1 -name '*.app' | head -n1)
+          codesign -dvv "$app" 2>&1 | grep -E '^(Authority|TeamIdentifier|Identifier|Runtime|Format)' || true
+          codesign -d --entitlements :- "$app" 2>&1 || true
+          security find-identity -v -p codesigning || true
+
+      - name: Notarize and staple (macOS Developer ID only)
+        if: github.event.client_payload.target == 'macos-developer-id'
+        run: |
+          set -euo pipefail
+          app=$(find "$RUNNER_TEMP/export" -maxdepth 1 -name '*.app' | head -n1)
+          if [ -z "$app" ]; then echo "no .app found after export" >&2; exit 1; fi
+          ditto -c -k --keepParent "$app" "$RUNNER_TEMP/notarize.zip"
+          key="$GITHUB_WORKSPACE/AuthKey_${{ steps.macsigning.outputs.key-id }}.p8"
+          set +e
+          xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" \
+            --key "$key" --key-id "${{ steps.macsigning.outputs.key-id }}" --issuer "${{ steps.macsigning.outputs.issuer-id }}" \
+            --wait --timeout 40m --output-format json > "$RUNNER_TEMP/notarize.json"
+          rc=$?
+          set -e
+          cat "$RUNNER_TEMP/notarize.json" || true
+          status=$(/usr/bin/python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("status",""))' "$RUNNER_TEMP/notarize.json" 2>/dev/null || true)
+          if [ "$rc" -ne 0 ] || [ "$status" != "Accepted" ]; then
+            id=$(/usr/bin/python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("id",""))' "$RUNNER_TEMP/notarize.json" 2>/dev/null || true)
+            if [ -n "$id" ]; then
+              xcrun notarytool log "$id" --key "$key" --key-id "${{ steps.macsigning.outputs.key-id }}" --issuer "${{ steps.macsigning.outputs.issuer-id }}" || true
+            fi
+            echo "notarization did not succeed (status='$status', exit=$rc)" >&2
+            exit 1
+          fi
+          xcrun stapler staple "$app"
+          spctl -a -vv -t exec "$app" || true
+
+      - name: Stage the notarized app (macOS Developer ID only)
+        if: github.event.client_payload.target == 'macos-developer-id'
+        run: |
+          app=$(find "$RUNNER_TEMP/export" -maxdepth 1 -name '*.app' | head -n1)
+          mkdir -p "$GITHUB_WORKSPACE/stage"
+          ditto -c -k --keepParent "$app" "$GITHUB_WORKSPACE/stage/app.zip"
+
       # Stage the .app alone in an otherwise-empty directory (rather than pointing upload-artifact at the
       # Products dir directly, which can also contain a .dSYM or other build byproducts): upload-artifact
       # zips the CONTENTS of `path`, not path itself, so the artifact's top-level entry must be exactly
       # `<name>.app/` — nothing else — to reconstruct a valid double-clickable/Appetize-loadable bundle.
       - name: Stage the built .app
-        if: github.event.client_payload.target != 'ios-device'
+        if: github.event.client_payload.target != 'ios-device' && github.event.client_payload.target != 'macos-developer-id'
         working-directory: src
         run: |
           if [ "${{ github.event.client_payload.target }}" = "macos" ]; then
