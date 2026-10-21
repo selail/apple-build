@@ -331,17 +331,27 @@ jobs:
           </plist>
           PLIST
 
+      # The profile must be set on the app target only: passed on the xcodebuild command line it reaches every
+      # Swift package resource bundle too (GoogleSignIn, AppAuth, ...), which fail with "does not support
+      # provisioning profiles". So patch the app target in project.yml and regenerate the project.
+      - name: Set manual signing on the app target (macOS Developer ID only)
+        if: github.event.client_payload.target == 'macos-developer-id'
+        working-directory: src
+        env:
+          PROFILE_UUID: ${{ steps.macprofile.outputs.profile-uuid }}
+        run: |
+          perl -0pi -e 's/^( +)CODE_SIGN_STYLE: Automatic$/$1CODE_SIGN_STYLE: Manual\n$1CODE_SIGN_IDENTITY: "Developer ID Application"\n$1PROVISIONING_PROFILE_SPECIFIER: "$ENV{PROFILE_UUID}"/m' project.yml
+          grep -q "CODE_SIGN_STYLE: Manual" project.yml || { echo "project.yml has no CODE_SIGN_STYLE to switch to Manual" >&2; exit 1; }
+          xcodegen generate
+
       - name: Archive (macOS Developer ID only)
         if: github.event.client_payload.target == 'macos-developer-id'
         working-directory: src
         run: |
-          # Manual signing with the uploaded Developer ID identity and the API-made profile (no Xcode cloud signing).
+          # Signing comes from the app target settings in project.yml (patched above); no xcodebuild overrides.
           xcodebuild archive -scheme "${{ steps.scheme.outputs.scheme }}" \
             -configuration Release \
-            -destination 'generic/platform=macOS' -archivePath "$RUNNER_TEMP/App.xcarchive" \
-            CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY="Developer ID Application" \
-            PROVISIONING_PROFILE_SPECIFIER="${{ steps.macprofile.outputs.profile-uuid }}" \
-            DEVELOPMENT_TEAM="${{ steps.macsigning.outputs.team-id }}"
+            -destination 'generic/platform=macOS' -archivePath "$RUNNER_TEMP/App.xcarchive"
 
       - name: Export with Developer ID (macOS Developer ID only)
         if: github.event.client_payload.target == 'macos-developer-id'
