@@ -300,13 +300,13 @@ jobs:
         if: github.event.client_payload.target == 'macos-developer-id'
         working-directory: src
         run: |
+          # Archive ad hoc: automatic signing here asks Apple for a Mac App Development profile, which needs a
+          # registered device the team does not have. The archive only has to carry the entitlements; the real
+          # Developer ID certificate and profile are obtained by the export step below.
           xcodebuild archive -scheme "${{ steps.scheme.outputs.scheme }}" \
             -configuration Release \
             -destination 'generic/platform=macOS' -archivePath "$RUNNER_TEMP/App.xcarchive" \
-            -allowProvisioningUpdates \
-            -authenticationKeyPath "$GITHUB_WORKSPACE/AuthKey_${{ steps.macsigning.outputs.key-id }}.p8" \
-            -authenticationKeyID "${{ steps.macsigning.outputs.key-id }}" \
-            -authenticationKeyIssuerID "${{ steps.macsigning.outputs.issuer-id }}"
+            CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY=- PROVISIONING_PROFILE_SPECIFIER=""
 
       - name: Export with Developer ID (macOS Developer ID only)
         if: github.event.client_payload.target == 'macos-developer-id'
