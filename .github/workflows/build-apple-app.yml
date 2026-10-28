@@ -159,62 +159,40 @@ jobs:
             core.setOutput('build-number', String(signing.buildNumber));
             core.setOutput('keychain-password', keychainPassword);
 
-      # First deploy of a project (no stored identity yet): make the development certificate OURSELVES instead of
-      # letting xcodebuild mint one. A key xcodebuild creates has an access rule that makes even
-      # `set-key-partition-list` wait for a keychain prompt nobody can answer, so the "Export signing identity for
-      # reuse" step below always timed out, nothing was ever stored, and every deploy minted another certificate
-      # until the account hit Apple's limit. A key we generate and import is exportable, so it is stored after
-      # this deploy and every later one reuses it. Best-effort: if anything here fails the build falls back to
+      # Luxi (the server) makes the Development signing certificate and keeps its key; this step only turns what it sent
+      # into the signing-identity.p12 the keychain step imports. Letting xcodebuild mint the certificate here never
+      # worked: a key it creates has an access rule that makes even `set-key-partition-list` wait for a keychain prompt
+      # nobody can answer, so the identity could not be exported for reuse, and every deploy minted another certificate
+      # until the account hit Apple's limit. Best-effort: with nothing sent (or a failure here) the build falls back to
       # xcodebuild's own minting, exactly as before.
-      - name: Create the signing certificate through the App Store Connect API (iOS device only, first deploy)
+      - name: Package the signing identity Luxi sent (iOS device only)
         if: github.event.client_payload.target == 'ios-device'
         continue-on-error: true
         uses: actions/github-script@v7
         with:
           script: |
             const fs = require('fs');
-            const crypto = require('crypto');
             const { execFileSync } = require('child_process');
+            const signing = JSON.parse(fs.readFileSync('signing.json', 'utf8'));
             if (fs.existsSync('signing-identity.p12')) {
-              console.log('A stored signing identity exists; reusing it.');
+              console.log('A stored signing identity was sent as a .p12; using it.');
               return;
             }
-            const signing = JSON.parse(fs.readFileSync('signing.json', 'utf8'));
-            const b64url = (b) => Buffer.from(b).toString('base64url');
-            const now = Math.floor(Date.now() / 1000);
-            const header = b64url(JSON.stringify({ alg: 'ES256', kid: signing.keyId, typ: 'JWT' }));
-            const claims = b64url(JSON.stringify({ iss: signing.issuerId, iat: now, exp: now + 600, aud: 'appstoreconnect-v1' }));
-            const signature = crypto.sign('sha256', Buffer.from(`${header}.${claims}`), {
-              key: signing.privateKeyP8,
-              dsaEncoding: 'ieee-p1363',
-            });
-            const jwt = `${header}.${claims}.${b64url(signature)}`;
-            core.setSecret(jwt);
-
-            const openssl = '/usr/bin/openssl';
-            execFileSync(openssl, ['genrsa', '-out', 'signing-key.pem', '2048'], { stdio: 'ignore' });
-            execFileSync(openssl, ['req', '-new', '-key', 'signing-key.pem', '-subj', '/CN=Luxi Build/O=Luxi', '-out', 'signing.csr']);
-            const csr = fs.readFileSync('signing.csr', 'utf8');
-
-            const response = await fetch('https://api.appstoreconnect.apple.com/v1/certificates', {
-              method: 'POST',
-              headers: { Authorization: `Bearer ${jwt}`, 'Content-Type': 'application/json' },
-              body: JSON.stringify({ data: { type: 'certificates', attributes: { certificateType: 'DEVELOPMENT', csrContent: csr } } }),
-            });
-            const body = await response.json().catch(() => ({}));
-            if (!response.ok) {
-              const detail = (body.errors || []).map((e) => `${e.code}: ${e.detail}`).join('; ');
-              throw new Error(`App Store Connect refused the certificate request (HTTP ${response.status}) ${detail}`);
+            if (!signing.signingKeyPem || !signing.signingCertificateDerBase64) {
+              console.log('No signing identity sent; xcodebuild will make its own.');
+              return;
             }
-            fs.writeFileSync('signing-cert.cer', Buffer.from(body.data.attributes.certificateContent, 'base64'));
+            fs.writeFileSync('signing-key.pem', signing.signingKeyPem, { mode: 0o600 });
+            fs.writeFileSync('signing-cert.cer', Buffer.from(signing.signingCertificateDerBase64, 'base64'));
+            const openssl = '/usr/bin/openssl';
             execFileSync(openssl, ['x509', '-inform', 'der', '-in', 'signing-cert.cer', '-out', 'signing-cert.pem']);
-            // The old 3DES/SHA1 container is what `security import` reads on every macOS version.
+            // The 3DES/SHA1 container is what `security import` reads on every macOS version.
             execFileSync(openssl, [
               'pkcs12', '-export', '-inkey', 'signing-key.pem', '-in', 'signing-cert.pem', '-out', 'signing-identity.p12',
-              '-passout', `file:p12-password.txt`, '-keypbe', 'PBE-SHA1-3DES', '-certpbe', 'PBE-SHA1-3DES', '-macalg', 'sha1',
+              '-passout', 'file:p12-password.txt', '-keypbe', 'PBE-SHA1-3DES', '-certpbe', 'PBE-SHA1-3DES', '-macalg', 'sha1',
             ]);
             fs.rmSync('signing-key.pem');
-            console.log(`Created a development certificate (id ${body.data.id}) and packaged it for reuse.`);
+            console.log('Packaged the signing identity sent by Luxi.');
 
       - name: Set up signing keychain (iOS device only)
         if: github.event.client_payload.target == 'ios-device'
@@ -265,25 +243,6 @@ jobs:
             -authenticationKeyPath "$GITHUB_WORKSPACE/AuthKey_${{ steps.signing.outputs.key-id }}.p8" \
             -authenticationKeyID "${{ steps.signing.outputs.key-id }}" \
             -authenticationKeyIssuerID "${{ steps.signing.outputs.issuer-id }}"
-
-      # Re-export whichever identity is now in the keychain -- unchanged bytes if an existing p12 was
-      # reused, a freshly-minted one if this was the project's first deploy -- so the caller can persist
-      # it for next time regardless of which case this was. Best-effort: a freshly Xcode-minted identity's
-      # default ACL can make even `set-key-partition-list` itself block on a keychain-access prompt that
-      # can never be answered headlessly (unlike a manually-imported identity, which never hits this) --
-      # the archive/export/upload to App Store Connect above has already fully succeeded by this point, so
-      # a failure here only means the next deploy re-mints a certificate instead of reusing this one, not
-      # that this deploy failed. continue-on-error keeps that from taking the whole job down.
-      - name: Export signing identity for reuse (iOS device only)
-        if: github.event.client_payload.target == 'ios-device'
-        timeout-minutes: 2
-        continue-on-error: true
-        run: |
-          KEYCHAIN="$RUNNER_TEMP/build.keychain"
-          KEYCHAIN_PW="${{ steps.signing.outputs.keychain-password }}"
-          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PW" "$KEYCHAIN"
-          security export -k "$KEYCHAIN" -t identities -f pkcs12 \
-            -P "$(cat p12-password.txt)" -o "$RUNNER_TEMP/signing-identity-out.p12"
 
       # No app binary to hand back for this target -- the artifact is a small JSON status blob instead
       # (AppleBuildOrchestrator.deployViaGithubActions parses it via deployOutcomeFromArtifactJson, not
