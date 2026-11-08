@@ -222,17 +222,66 @@ jobs:
           # instead of ours, and the later "export for reuse" step finds nothing to export.
           security default-keychain -s "$KEYCHAIN"
 
+      # The Swift packages (Stripe's PaymentSheet for an app with native payments, GoogleSignIn) are most of an
+      # archive's time when compiled from scratch: about 4 of 5 minutes for an app with Stripe. Their build products
+      # are kept between runs of the same app. Xcode names its archive build folders after the scheme, so the cache is
+      # per scheme (a different app starts cold) and the derived data path is fixed so the restored paths match.
+      # This repo is PUBLIC and a fork's workflow can read its caches, so only the open-source packages' outputs are
+      # saved: the "Prune" step below deletes everything the app itself produced first (its objects, the signed
+      # product, the build logs). Saved only after a successful archive, under a new key each run; restore takes the
+      # newest for this Xcode and scheme, and GitHub evicts the oldest past the repo's 10 GB.
+      - name: Xcode version (iOS device only)
+        if: github.event.client_payload.target == 'ios-device'
+        id: xcode
+        run: echo "version=$(xcodebuild -version | head -1 | tr -cd 'A-Za-z0-9.')" >> "$GITHUB_OUTPUT"
+
+      - name: Restore package build cache (iOS device only)
+        if: github.event.client_payload.target == 'ios-device'
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/dd
+          key: apple-pkg-v1-${{ steps.xcode.outputs.version }}-${{ steps.scheme.outputs.scheme }}-${{ github.run_id }}
+          restore-keys: |
+            apple-pkg-v1-${{ steps.xcode.outputs.version }}-${{ steps.scheme.outputs.scheme }}-
+
       - name: Archive (iOS device only)
         if: github.event.client_payload.target == 'ios-device'
         working-directory: src
         run: |
           xcodebuild archive -scheme "${{ steps.scheme.outputs.scheme }}" \
             -configuration Release \
+            -derivedDataPath "$RUNNER_TEMP/dd" \
             -destination 'generic/platform=iOS' -archivePath "$RUNNER_TEMP/App.xcarchive" \
             -allowProvisioningUpdates \
             -authenticationKeyPath "$GITHUB_WORKSPACE/AuthKey_${{ steps.signing.outputs.key-id }}.p8" \
             -authenticationKeyID "${{ steps.signing.outputs.key-id }}" \
             -authenticationKeyIssuerID "${{ steps.signing.outputs.issuer-id }}"
+
+      # Leaves only the Swift packages' build outputs (open source) and Xcode's module caches; see the cache comment
+      # above. Anything named after the app's scheme, the installed (signed) products and the logs go.
+      - name: Prune the app's own build outputs before caching (iOS device only)
+        if: github.event.client_payload.target == 'ios-device'
+        env:
+          SCHEME: ${{ steps.scheme.outputs.scheme }}
+        run: |
+          dd="$RUNNER_TEMP/dd"
+          project=$(basename src/*.xcodeproj .xcodeproj)
+          rm -rf "$dd/Logs" "$dd/info.plist"
+          archive="$dd/Build/Intermediates.noindex/ArchiveIntermediates/$SCHEME"
+          # The app's own objects sit under its project's folder (packages each have their own <Package>.build).
+          rm -rf "$archive/InstallationBuildProductsLocation" "$archive/IntermediateBuildFilesPath/$project.build"
+          # The per-scheme archive folder itself is named like the scheme: it holds the packages' outputs, so it stays.
+          find "$dd/Build" -depth ! -path "$archive" \
+            \( -name "$SCHEME" -o -name "$SCHEME.*" -o -name "$project.*" -o -name "*.xcent" -o -name "*.mobileprovision" \) \
+            -exec rm -rf {} + 2>/dev/null || true
+          du -sh "$dd" || true
+
+      - name: Save package build cache (iOS device only)
+        if: github.event.client_payload.target == 'ios-device'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/dd
+          key: apple-pkg-v1-${{ steps.xcode.outputs.version }}-${{ steps.scheme.outputs.scheme }}-${{ github.run_id }}
 
       - name: Export & upload to App Store Connect (iOS device only)
         if: github.event.client_payload.target == 'ios-device'
